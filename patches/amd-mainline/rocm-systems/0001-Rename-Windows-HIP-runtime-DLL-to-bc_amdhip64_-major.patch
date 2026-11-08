@@ -1,0 +1,44 @@
+From 339bd2ddedb48c237b9430a1901610a4017301a3 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sun, 8 Nov 2026 11:34:45 -0800
+Subject: [PATCH] Rename Windows HIP runtime DLL to bc_amdhip64_<major>.dll
+
+Prefix the Windows HIP runtime DLL with "bc_" so it does not collide with
+the driver-installed amdhip64_<major>.dll in System32, and update hiprtc
+findIsa() to load the DLL by its new name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ projects/clr/hipamd/src/CMakeLists.txt       | 2 +-
+ projects/clr/hipamd/src/hip_comgr_helper.cpp | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/projects/clr/hipamd/src/CMakeLists.txt b/projects/clr/hipamd/src/CMakeLists.txt
+index e8c2b4e89d4..26d07f90417 100644
+--- a/projects/clr/hipamd/src/CMakeLists.txt
++++ b/projects/clr/hipamd/src/CMakeLists.txt
+@@ -21,7 +21,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+ if(BUILD_SHARED_LIBS)
+   add_library(amdhip64 SHARED)
+   if(WIN32)
+-    set_target_properties(amdhip64 PROPERTIES RUNTIME_OUTPUT_NAME "amdhip64_${HIP_VERSION_MAJOR}")
++    set_target_properties(amdhip64 PROPERTIES RUNTIME_OUTPUT_NAME "bc_amdhip64_${HIP_VERSION_MAJOR}")
+   endif()
+   # Windows doesn't have a strip utility, so CMAKE_STRIP won't be set.
+   if((CMAKE_BUILD_TYPE STREQUAL "Release") AND NOT ("${CMAKE_STRIP}" STREQUAL ""))
+diff --git a/projects/clr/hipamd/src/hip_comgr_helper.cpp b/projects/clr/hipamd/src/hip_comgr_helper.cpp
+index 0e97cc82e33..3b5c11d32ec 100644
+--- a/projects/clr/hipamd/src/hip_comgr_helper.cpp
++++ b/projects/clr/hipamd/src/hip_comgr_helper.cpp
+@@ -663,7 +663,7 @@ bool RTCProgram::findIsa() {
+ #ifdef BUILD_SHARED_LIBS
+   const char* libName;
+ #ifdef _WIN32
+-  std::string dll_name = std::string("amdhip64_" + std::to_string(HIP_VERSION_MAJOR) + ".dll");
++  std::string dll_name = std::string("bc_amdhip64_" + std::to_string(HIP_VERSION_MAJOR) + ".dll");
+   libName = dll_name.c_str();
+ #else
+   std::string so_name = std::string("libamdhip64.so." + std::to_string(HIP_VERSION_MAJOR));
+-- 
+2.56.0.windows.4
+

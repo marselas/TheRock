@@ -1,0 +1,30 @@
+From 68b5cfc6aea5614ce5251494ea9a21ba5baf0a96 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sun, 8 Nov 2026 11:34:47 -0800
+Subject: [PATCH] hipdnn: look up the HIP runtime as bc_amdhip64_<major>.dll on
+ Windows
+
+Matches the renamed HIP runtime DLL so hipRuntimeDirectory() can find the
+loaded module.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../include/hipdnn_frontend/detail/DynamicBackendLibrary.hpp    | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/projects/hipdnn/frontend/include/hipdnn_frontend/detail/DynamicBackendLibrary.hpp b/projects/hipdnn/frontend/include/hipdnn_frontend/detail/DynamicBackendLibrary.hpp
+index c2b42801501..1b1e4e23716 100644
+--- a/projects/hipdnn/frontend/include/hipdnn_frontend/detail/DynamicBackendLibrary.hpp
++++ b/projects/hipdnn/frontend/include/hipdnn_frontend/detail/DynamicBackendLibrary.hpp
+@@ -110,7 +110,7 @@ HIPDNN_HIDDEN inline std::filesystem::path hipRuntimeDirectory()
+ 
+ #ifdef _WIN32
+     const std::string versionedName
+-        = std::string("amdhip64_") + std::to_string(HIP_VERSION_MAJOR) + ".dll";
++        = std::string("bc_amdhip64_") + std::to_string(HIP_VERSION_MAJOR) + ".dll";
+ #else
+     const std::string versionedName
+         = utilities::getLibraryName("amdhip64") + "." + std::to_string(HIP_VERSION_MAJOR);
+-- 
+2.56.0.windows.4
+
