@@ -1,0 +1,86 @@
+From 5bd696998b04ca8b264103c476ca2cf75bc7ea48 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Fri, 13 Nov 2026 21:39:48 -0800
+Subject: [PATCH] Add hipExtEventGetTimestamps: the start/end HIP records for
+ an event's command
+
+hipEventElapsedTime can only subtract two events' END times, so it cannot
+report a kernel's own duration. A hipEventRecord marker placed before a
+launch is timestamped by its own AQL barrier packet. On gfx1201 that
+timestamp was measured tens of microseconds early, or up to 160 us after the
+kernel had ended.
+
+hipExtEventGetTimestamps(event, &start_ns, &end_ns) returns
+Event::time(true/false), i.e. the profiling start/end of the bound command.
+For an event bound to a dispatch via hipExtModuleLaunchKernel's stopEvent,
+that is the kernel's own start/end, which is what OpenCL's
+CL_PROFILING_COMMAND_START/END report. It is a plain C export listed in
+amdhip.def.in and is deliberately outside the API dispatch table.
+
+Used by the rockchip OpenCL runtime: the Khronos SDK reduce sample now
+reports 29/3/2 us per pass, vs 32/4/4 us on AMD's OpenCL runtime (before:
+marker intervals that read 40/13/40 us or wrapped negative).
+---
+ projects/clr/hipamd/src/amdhip.def.in |  1 +
+ projects/clr/hipamd/src/hip_event.cpp | 36 +++++++++++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/projects/clr/hipamd/src/amdhip.def.in b/projects/clr/hipamd/src/amdhip.def.in
+index 26db749a1d..c19a086bdd 100644
+--- a/projects/clr/hipamd/src/amdhip.def.in
++++ b/projects/clr/hipamd/src/amdhip.def.in
+@@ -59,6 +59,7 @@ hipExtLaunchMultiKernelMultiDevice
+ hipExtMallocWithFlags
+ hipExtModuleLaunchKernel
+ hipExtLaunchKernel
++hipExtEventGetTimestamps
+ hipFree
+ hipFreeArray
+ hipFuncSetAttribute
+diff --git a/projects/clr/hipamd/src/hip_event.cpp b/projects/clr/hipamd/src/hip_event.cpp
+index bd52917b11..ecdfc48e8d 100644
+--- a/projects/clr/hipamd/src/hip_event.cpp
++++ b/projects/clr/hipamd/src/hip_event.cpp
+@@ -597,3 +597,39 @@ hipError_t hipEventQuery(hipEvent_t event) {
+   HIP_RETURN(ihipEventQuery(event));
+ }
+ }  // namespace hip
++
++// ================================================================================================
++// hipExtEventGetTimestamps -- local TheRock patch (rockchip OpenCL runtime, 2026-11-13).
++//
++// The start and end timestamps (ns) HIP already records for the command an event is bound to.
++// hipEventElapsedTime can only subtract two events' END times, so it can never report a kernel's
++// own duration: a hipEventRecord marker before the launch is timestamped by its own AQL barrier
++// packet, which on gfx1201 was measured tens of us early or up to 160 us AFTER the kernel ended.
++// For an event bound to a kernel dispatch (hipExtModuleLaunchKernel's stopEvent), start/end here
++// are that dispatch's start/end -- what OpenCL's CL_PROFILING_COMMAND_START/END report.
++// Deliberately outside the API dispatch table (no tracing hook): a plain C export.
++extern "C" hipError_t hipExtEventGetTimestamps(hipEvent_t event, uint64_t* start_ns,
++                                               uint64_t* end_ns) {
++  if (event == nullptr || !hip::isValid(event)) {
++    return hipErrorInvalidHandle;
++  }
++  if (start_ns == nullptr && end_ns == nullptr) {
++    return hipErrorInvalidValue;
++  }
++  auto* const e = reinterpret_cast<hip::Event*>(event);
++  std::scoped_lock lock(e->lock());
++  if (e->event() == nullptr || (e->flags() & hipEventDisableTiming)) {
++    return hipErrorInvalidHandle;
++  }
++  if (!e->ready()) {
++    return hipErrorNotReady;
++  }
++  e->awaitEventCompletion();  // CPU-side status (and profiling info) may lag the HW signal
++  if (start_ns != nullptr) {
++    *start_ns = static_cast<uint64_t>(e->time(true));
++  }
++  if (end_ns != nullptr) {
++    *end_ns = static_cast<uint64_t>(e->time(false));
++  }
++  return hipSuccess;
++}
+-- 
+2.56.0.windows.4
+
