@@ -1,0 +1,85 @@
+From a4d0e1de15c475deb1a869aa89bf6fe185034ec0 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 15:54:32 -0800
+Subject: [PATCH] AMDGCN reader: OpenCL printf, constant UniformConstant,
+ atomic inc/dec
+
+- OpenCL.std printf in a module with no printf declaration: declare
+  i32 printf(fmt, ...) instead of building a call on a null function
+  (crashed the translator: every OpenCL printf in SPIR-V).
+- An initialized UniformConstant variable is constant even without the
+  Constant decoration; the AMDGPU printf lowering requires constant
+  format strings.
+- OpAtomicIIncrement/IDecrement: atomicrmw add/sub 1. As uinc_wrap/
+  udec_wrap the non-value operand became the wrap limit and
+  uinc_wrap(p, 0) stored 0 every time.
+---
+ lib/SPIRV/SPIRVReader.cpp  | 17 ++++++++++++++++-
+ lib/SPIRV/SPIRVToOCL20.cpp | 13 ++++++++++---
+ 2 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/lib/SPIRV/SPIRVReader.cpp b/lib/SPIRV/SPIRVReader.cpp
+index 9113147b..ce670454 100644
+--- a/lib/SPIRV/SPIRVReader.cpp
++++ b/lib/SPIRV/SPIRVReader.cpp
+@@ -1965,10 +1965,13 @@ Value *SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
+         PreTransTy = DT;
+     }
+     auto *Ty = transType(PreTransTy);
+-    bool IsConst = BVar->isConstant();
+     llvm::GlobalValue::LinkageTypes LinkageTy = transLinkageType(BVar);
+     SPIRVStorageClassKind BS = BVar->getStorageClass();
+     SPIRVValue *Init = BVar->getInitializer();
++    // UniformConstant memory is read-only (OpenCL __constant), decorated Constant or not. Without
++    // this an undecorated printf format string became a mutable global, and the AMDGPU printf
++    // lowering refuses any format that is not a constant string global.
++    bool IsConst = BVar->isConstant() || (BS == StorageClassUniformConstant && Init);
+ 
+     if (PreTransTy->isTypeSampler() && BS == StorageClassUniformConstant) {
+       // Skip generating llvm code during translation of a variable definition,
+@@ -6374,6 +6377,18 @@ Instruction *SPIRVToLLVM::transLLVMFromExtInst(SPIRVExtInst *BC, Type *RetTy,
+     if (ID == Intrinsic::not_intrinsic) {
+       if (Op == OpenCLLIB::Printf) {
+         F = M->getFunction("printf");
++        // An OpenCL.std printf in a module that never declared printf (every OpenCL-produced
++        // SPIR-V): declare it, i32 printf(<format pointer>, ...), or the call below is built
++        // on a null function and the translator crashes.
++        if (!F) {
++          Type *FmtTy = !ArgTys.empty() && ArgTys[0]->isPointerTy()
++                            ? ArgTys[0]
++                            : PointerType::get(M->getContext(), 4);
++          F = Function::Create(
++              FunctionType::get(Type::getInt32Ty(M->getContext()), {FmtTy},
++                                /*isVarArg=*/true),
++              GlobalValue::ExternalLinkage, "printf", M);
++        }
+       } else {
+         errs() << "Failed to handle OpenCL Extended Op: " << Op << '\n';
+         std::abort();
+diff --git a/lib/SPIRV/SPIRVToOCL20.cpp b/lib/SPIRV/SPIRVToOCL20.cpp
+index cee0bbc9..959f2ddf 100644
+--- a/lib/SPIRV/SPIRVToOCL20.cpp
++++ b/lib/SPIRV/SPIRVToOCL20.cpp
+@@ -174,9 +174,16 @@ static void translateSPIRVAtomicBuiltinToLLVMAtomicOp(CallInst *CI, Op OC) {
+     ST->setAtomic(Order, S);
+     CI->replaceAllUsesWith(ST);
+   } else {
+-    auto RMW =
+-        Builder.CreateAtomicRMW(getAtomicRMWInstForOp(OC), CI->getOperand(0),
+-                                CI->getOperand(1), {}, Order, S);
++    // OpAtomicIIncrement / OpAtomicIDecrement are +1 / -1 with wrap-around and have no value
++    // operand: operand 1 here is not a value. As uinc_wrap/udec_wrap it became the wrap LIMIT
++    // -- uinc_wrap(p, 0) stores 0 every time (CTS spirv_new op_atomic_inc_global: 0, not 65536).
++    // Plain add/sub of 1 is exactly the SPIR-V semantics.
++    const bool IncDec = OC == OpAtomicIIncrement || OC == OpAtomicIDecrement;
++    Value *Val = IncDec ? ConstantInt::get(CI->getType(), 1) : CI->getOperand(1);
++    auto RMW = Builder.CreateAtomicRMW(
++        IncDec ? (OC == OpAtomicIIncrement ? AtomicRMWInst::Add : AtomicRMWInst::Sub)
++               : getAtomicRMWInstForOp(OC),
++        CI->getOperand(0), Val, {}, Order, S);
+     for (auto &&MD : {"amdgpu.no.fine.grained.memory",
+                       "amdgpu.no.remote.memory",
+                       "amdgpu.ignore.denormal.mode"})
+-- 
+2.56.0.windows.4
+
