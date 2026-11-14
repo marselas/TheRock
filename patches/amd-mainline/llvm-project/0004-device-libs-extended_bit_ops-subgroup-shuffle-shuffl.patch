@@ -1,0 +1,224 @@
+From f79552be77959b1a2eabeb5d1fc0a567e3ef342c Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 15:25:36 -0800
+Subject: [PATCH] device-libs: extended_bit_ops, subgroup
+ shuffle/shuffle_relative/rotate, extended_types
+
+- cl_khr_extended_bit_ops: bitfield_insert, bitfield_extract_signed/unsigned,
+  bit_reverse for every integer scalar and vector type.
+- cl_khr_subgroup_shuffle / _shuffle_relative / _rotate: ds_bpermute with the
+  lane index kept inside the wave; rotate is mod the max sub-group size,
+  clustered rotate within aligned power-of-two clusters.
+- cl_khr_subgroup_extended_types: 8/16-bit broadcast/reduce/scan (32-bit
+  arithmetic; add truncates, min/max clamp so a promoted exclusive-scan
+  identity becomes the narrow type's) and vector broadcast for every type.
+
+These are also what the SPIR-V translator lowers OpBitField*/OpBitReverse
+and OpGroupNonUniformShuffle*/RotateKHR to.
+---
+ .../opencl/src/integer/extbitops.cl           | 43 ++++++++++
+ amd/device-libs/opencl/src/subgroup/subext.cl | 48 +++++++++++
+ .../opencl/src/subgroup/subshuffle.cl         | 86 +++++++++++++++++++
+ 3 files changed, 177 insertions(+)
+ create mode 100644 amd/device-libs/opencl/src/integer/extbitops.cl
+ create mode 100644 amd/device-libs/opencl/src/subgroup/subext.cl
+ create mode 100644 amd/device-libs/opencl/src/subgroup/subshuffle.cl
+
+diff --git a/amd/device-libs/opencl/src/integer/extbitops.cl b/amd/device-libs/opencl/src/integer/extbitops.cl
+new file mode 100644
+index 000000000000..eff2d5f5d8b3
+--- /dev/null
++++ b/amd/device-libs/opencl/src/integer/extbitops.cl
+@@ -0,0 +1,43 @@
++/*===--------------------------------------------------------------------------
++ *                   ROCm Device Libraries
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See LICENSE.TXT for details.
++ *===------------------------------------------------------------------------*/
++
++// cl_khr_extended_bit_ops: bitfield_insert, bitfield_extract_signed/unsigned and bit_reverse for
++// every integer scalar and vector type (also the targets of SPIR-V OpBitFieldInsert,
++// OpBitField[SU]Extract and OpBitReverse).
++//
++// OpenCL C reduces a shift count modulo the bit width, so the shift formulas below are defined
++// for every count from 1 to the width; count == 0 (which the modulo would turn into a full-width
++// mask) is the one special case.
++
++#define ATTR __attribute__((overloadable, const))
++
++// T: the type; U / I: its unsigned / signed counterpart (same width and vector size); W: bits.
++#define BITOPS(T, U, I, W) \
++ATTR T bitfield_insert(T base, T insert, uint offset, uint count) \
++{ \
++    U mask = count == 0u ? (U)0 : (U)((U)(~(U)0) >> (W - count)) << offset; \
++    return as_##T((U)((as_##U(base) & ~mask) | ((as_##U(insert) << offset) & mask))); \
++} \
++ATTR I bitfield_extract_signed(T base, uint offset, uint count) \
++{ \
++    return count == 0u ? (I)0 : (I)(as_##I(base) << (W - offset - count)) >> (W - count); \
++} \
++ATTR U bitfield_extract_unsigned(T base, uint offset, uint count) \
++{ \
++    return count == 0u ? (U)0 : (U)(as_##U(base) << (W - offset - count)) >> (W - count); \
++} \
++ATTR T bit_reverse(T x) { return as_##T(__builtin_elementwise_bitreverse(as_##U(x))); }
++
++#define BITOPS_N(S, US, IS, W) \
++    BITOPS(S, US, IS, W) \
++    BITOPS(S##2, US##2, IS##2, W) BITOPS(S##3, US##3, IS##3, W) BITOPS(S##4, US##4, IS##4, W) \
++    BITOPS(S##8, US##8, IS##8, W) BITOPS(S##16, US##16, IS##16, W)
++
++BITOPS_N(char, uchar, char, 8)    BITOPS_N(uchar, uchar, char, 8)
++BITOPS_N(short, ushort, short, 16) BITOPS_N(ushort, ushort, short, 16)
++BITOPS_N(int, uint, int, 32)       BITOPS_N(uint, uint, int, 32)
++BITOPS_N(long, ulong, long, 64)    BITOPS_N(ulong, ulong, long, 64)
+diff --git a/amd/device-libs/opencl/src/subgroup/subext.cl b/amd/device-libs/opencl/src/subgroup/subext.cl
+new file mode 100644
+index 000000000000..a9a4f798711b
+--- /dev/null
++++ b/amd/device-libs/opencl/src/subgroup/subext.cl
+@@ -0,0 +1,48 @@
++/*===--------------------------------------------------------------------------
++ *                   ROCm Device Libraries
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See LICENSE.TXT for details.
++ *===------------------------------------------------------------------------*/
++
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++// cl_khr_subgroup_extended_types: broadcast of 8/16-bit scalars and of every vector type, and
++// reduce/scan of 8/16-bit scalars, on top of the 32/64-bit sub-group functions.
++//
++// Reduce/scan run in 32 bits. add truncates (the wrap-around the narrow type would have done);
++// min/max clamp, which leaves every real result alone and turns a promoted exclusive-scan
++// identity (INT_MAX/INT_MIN/UINT_MAX in the first lane) into the narrow type's identity.
++
++#define ATTR __attribute__((overloadable))
++
++#define BC_NARROW(T, W) ATTR T sub_group_broadcast(T x, uint i) { return (T)sub_group_broadcast((W)x, i); }
++BC_NARROW(char, int) BC_NARROW(uchar, uint) BC_NARROW(short, int) BC_NARROW(ushort, uint)
++
++#define BC_VEC(T, N) \
++ATTR T##N sub_group_broadcast(T##N x, uint i) \
++{ \
++    T##N r; \
++    for (int k = 0; k < N; ++k) ((T*)&r)[k] = sub_group_broadcast(((T*)&x)[k], i); \
++    return r; \
++}
++#define BC_VECS(T) BC_VEC(T, 2) BC_VEC(T, 3) BC_VEC(T, 4) BC_VEC(T, 8) BC_VEC(T, 16)
++BC_VECS(char) BC_VECS(uchar) BC_VECS(short) BC_VECS(ushort) BC_VECS(int) BC_VECS(uint)
++BC_VECS(long) BC_VECS(ulong) BC_VECS(float) BC_VECS(double) BC_VECS(half)
++
++#define RS_S(T, LO, HI, F) \
++ATTR T sub_group_##F##_add(T x) { return (T)sub_group_##F##_add((int)x); } \
++ATTR T sub_group_##F##_min(T x) { return (T)clamp(sub_group_##F##_min((int)x), (int)(LO), (int)(HI)); } \
++ATTR T sub_group_##F##_max(T x) { return (T)clamp(sub_group_##F##_max((int)x), (int)(LO), (int)(HI)); }
++#define RS_U(T, HI, F) \
++ATTR T sub_group_##F##_add(T x) { return (T)sub_group_##F##_add((uint)x); } \
++ATTR T sub_group_##F##_min(T x) { return (T)min(sub_group_##F##_min((uint)x), (uint)(HI)); } \
++ATTR T sub_group_##F##_max(T x) { return (T)min(sub_group_##F##_max((uint)x), (uint)(HI)); }
++
++#define RS_ALL(F) \
++    RS_S(char, CHAR_MIN, CHAR_MAX, F) RS_U(uchar, UCHAR_MAX, F) \
++    RS_S(short, SHRT_MIN, SHRT_MAX, F) RS_U(ushort, USHRT_MAX, F)
++
++RS_ALL(reduce)
++RS_ALL(scan_inclusive)
++RS_ALL(scan_exclusive)
+diff --git a/amd/device-libs/opencl/src/subgroup/subshuffle.cl b/amd/device-libs/opencl/src/subgroup/subshuffle.cl
+new file mode 100644
+index 000000000000..2628880da5f9
+--- /dev/null
++++ b/amd/device-libs/opencl/src/subgroup/subshuffle.cl
+@@ -0,0 +1,86 @@
++/*===--------------------------------------------------------------------------
++ *                   ROCm Device Libraries
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See LICENSE.TXT for details.
++ *===------------------------------------------------------------------------*/
++
++#include "oclc.h"
++#include "ockl.h"
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++// cl_khr_subgroup_shuffle, cl_khr_subgroup_shuffle_relative, cl_khr_subgroup_rotate (also the
++// targets the SPIR-V translator lowers OpGroupNonUniformShuffle*/RotateKHR to). A sub-group is a
++// wavefront; every exchange is ds_bpermute with an explicit lane index, kept inside the wave so
++// an out-of-range index (undefined per the spec) never reads another wave's lanes.
++
++#define ATTR __attribute__((overloadable))
++
++static inline uint lane_ok(uint i) { return i & (OCLC_WAVEFRONT_SIZE - 1u); }
++
++static inline uint perm32(uint i, uint v)
++{
++    return (uint)__builtin_amdgcn_ds_bpermute((int)(lane_ok(i) << 2), (int)v);
++}
++
++static inline ulong perm64(uint i, ulong v)
++{
++    uint2 p = as_uint2(v);
++    p.x = perm32(i, p.x);
++    p.y = perm32(i, p.y);
++    return as_ulong(p);
++}
++
++// One overload per type, built on a 32- or 64-bit lane move.
++#define GEN32(T, OP) ATTR T OP(T x, uint i_) { return (T)perm32(IDX, (uint)x); }
++#define GENF(T, OP)  ATTR T OP(T x, uint i_) { return as_float(perm32(IDX, as_uint(x))); }
++#define GENH(T, OP)  ATTR T OP(T x, uint i_) { return as_half((ushort)perm32(IDX, (uint)as_ushort(x))); }
++#define GEN64(T, OP) ATTR T OP(T x, uint i_) { return (T)perm64(IDX, (ulong)x); }
++#define GEND(T, OP)  ATTR T OP(T x, uint i_) { return as_double(perm64(IDX, as_ulong(x))); }
++
++#define GENALL(OP) \
++    GEN32(char, OP) GEN32(uchar, OP) GEN32(short, OP) GEN32(ushort, OP) GEN32(int, OP) GEN32(uint, OP) \
++    GEN64(long, OP) GEN64(ulong, OP) GENF(float, OP) GEND(double, OP) GENH(half, OP)
++
++#define IDX i_
++GENALL(sub_group_shuffle)
++#undef IDX
++#define IDX (__ockl_lane_u32() ^ i_)
++GENALL(sub_group_shuffle_xor)
++#undef IDX
++#define IDX (__ockl_lane_u32() - i_)
++GENALL(sub_group_shuffle_up)
++#undef IDX
++#define IDX (__ockl_lane_u32() + i_)
++GENALL(sub_group_shuffle_down)
++#undef IDX
++
++// Rotate: lane (id + delta) mod the max sub-group size; clustered: within aligned clusters of a
++// power-of-two size.
++static inline uint rot_idx(int delta)
++{
++    int n = (int)get_max_sub_group_size();
++    int r = ((int)__ockl_lane_u32() + delta) % n;
++    return (uint)(r < 0 ? r + n : r);
++}
++
++static inline uint crot_idx(int delta, uint cs)
++{
++    uint lid = __ockl_lane_u32();
++    return (lid & ~(cs - 1u)) + ((lid + (uint)delta) & (cs - 1u));
++}
++
++#define RGEN32(T) ATTR T sub_group_rotate(T x, int d) { return (T)perm32(rot_idx(d), (uint)x); } \
++                  ATTR T sub_group_clustered_rotate(T x, int d, uint cs) { return (T)perm32(crot_idx(d, cs), (uint)x); }
++#define RGEN64(T) ATTR T sub_group_rotate(T x, int d) { return (T)perm64(rot_idx(d), (ulong)x); } \
++                  ATTR T sub_group_clustered_rotate(T x, int d, uint cs) { return (T)perm64(crot_idx(d, cs), (ulong)x); }
++
++RGEN32(char) RGEN32(uchar) RGEN32(short) RGEN32(ushort) RGEN32(int) RGEN32(uint)
++RGEN64(long) RGEN64(ulong)
++
++ATTR float sub_group_rotate(float x, int d) { return as_float(perm32(rot_idx(d), as_uint(x))); }
++ATTR float sub_group_clustered_rotate(float x, int d, uint cs) { return as_float(perm32(crot_idx(d, cs), as_uint(x))); }
++ATTR double sub_group_rotate(double x, int d) { return as_double(perm64(rot_idx(d), as_ulong(x))); }
++ATTR double sub_group_clustered_rotate(double x, int d, uint cs) { return as_double(perm64(crot_idx(d, cs), as_ulong(x))); }
++ATTR half sub_group_rotate(half x, int d) { return as_half((ushort)perm32(rot_idx(d), (uint)as_ushort(x))); }
++ATTR half sub_group_clustered_rotate(half x, int d, uint cs) { return as_half((ushort)perm32(crot_idx(d, cs), (uint)as_ushort(x))); }
+-- 
+2.56.0.windows.4
+
