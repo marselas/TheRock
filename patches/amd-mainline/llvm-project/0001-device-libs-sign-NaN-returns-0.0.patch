@@ -1,0 +1,30 @@
+From 113ec0ce7253640350bd201eea6582aa8baa1e00 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 12:33:35 -0800
+Subject: [PATCH] device-libs: sign(NaN) returns +0.0
+
+The OpenCL specification: sign(x) returns 1.0 if x > 0, -0.0 if x = -0.0,
++0.0 if x = +0.0, -1.0 if x < 0, and 0.0 if x is a NaN. The implementation
+computed copysign(0, x) for a NaN, so a NaN with the sign bit set returned
+-0.0. The OpenCL CTS commonfns `sign` test checks this for half
+(sign(-nan) returned -0x0p+0).
+---
+ amd/device-libs/opencl/src/common/sign.cl | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/amd/device-libs/opencl/src/common/sign.cl b/amd/device-libs/opencl/src/common/sign.cl
+index d3254df6942a..0e1818574af1 100644
+--- a/amd/device-libs/opencl/src/common/sign.cl
++++ b/amd/device-libs/opencl/src/common/sign.cl
+@@ -13,7 +13,7 @@
+ ATTR T##N \
+ sign(T##N x) \
+ { \
+-    return copysign((isnan(x) | (x == (T##N)0)) ? (T##N)0 : (T##N)1, x); \
++    return isnan(x) ? (T##N)0 : copysign((x == (T##N)0) ? (T##N)0 : (T##N)1, x); \
+ }
+ 
+ #define GEN(T) \
+-- 
+2.56.0.windows.4
+
