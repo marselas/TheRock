@@ -1,0 +1,50 @@
+From bfb45f38fdb44cfbf2217213d21dbfa29d7f251c Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 15:16:29 -0800
+Subject: [PATCH 3/3] device-libs: cl_khr_kernel_clock builtins
+
+clock_read_{device,work_group,sub_group} and the _hilo forms (also the
+target of SPIR-V OpReadClockKHR). Every scope reads the steady counter:
+the shader cycle counter was measured running backwards across a
+preemption on gfx1201.
+---
+ .../opencl/src/misc/kernel_clock.cl           | 27 +++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+ create mode 100644 amd/device-libs/opencl/src/misc/kernel_clock.cl
+
+diff --git a/amd/device-libs/opencl/src/misc/kernel_clock.cl b/amd/device-libs/opencl/src/misc/kernel_clock.cl
+new file mode 100644
+index 000000000000..fc9851a17eea
+--- /dev/null
++++ b/amd/device-libs/opencl/src/misc/kernel_clock.cl
+@@ -0,0 +1,27 @@
++/*===--------------------------------------------------------------------------
++ *                   ROCm Device Libraries
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See LICENSE.TXT for details.
++ *===------------------------------------------------------------------------*/
++
++#include "ockl.h"
++
++// cl_khr_kernel_clock (also the target of SPIR-V OpReadClockKHR). Every scope reads the
++// constant-rate steady counter (s_sendmsg_rtn REALTIME on gfx12, 100 MHz on gfx1201).
++//
++// Not the shader cycle counter, though it has far better resolution: measured on gfx1201 with
++// another GPU workload running, 2 of 7 single-wave runs read it BACKWARDS across a loop
++// (a delta near 2^64), each time with the steady clock showing the wave held 3-12x longer than
++// normal -- a preempted wave resumes on hardware whose SHADER_CYCLES differs. A clock that can
++// run backwards breaks the one property every caller relies on.
++
++#define ATTR __attribute__((overloadable))
++
++#define CLOCK(SCOPE) \
++ATTR ulong clock_read_##SCOPE(void) { return __ockl_steadyctr_u64(); } \
++ATTR uint2 clock_read_hilo_##SCOPE(void) { ulong t = __ockl_steadyctr_u64(); return (uint2)((uint)t, (uint)(t >> 32)); }
++
++CLOCK(device)
++CLOCK(work_group)
++CLOCK(sub_group)
+-- 
+2.56.0.windows.4
+

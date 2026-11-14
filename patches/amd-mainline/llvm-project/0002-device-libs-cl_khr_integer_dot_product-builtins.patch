@@ -1,0 +1,58 @@
+From c4f84802831a511c41005b5677f2351d52a3833a Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 15:16:29 -0800
+Subject: [PATCH 2/3] device-libs: cl_khr_integer_dot_product builtins
+
+dot / dot_acc_sat on char4/uchar4 (all four signedness pairs) and the
+dot_*4x8packed_{uu,ss,us,su}_* forms. Portable C: the library is target
+independent. Also the targets the SPIR-V translator lowers OpSDot/OpUDot/
+OpSUDot(+AccSat) to.
+---
+ .../opencl/src/integer/integer_dot.cl         | 35 +++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+ create mode 100644 amd/device-libs/opencl/src/integer/integer_dot.cl
+
+diff --git a/amd/device-libs/opencl/src/integer/integer_dot.cl b/amd/device-libs/opencl/src/integer/integer_dot.cl
+new file mode 100644
+index 000000000000..e7f897127889
+--- /dev/null
++++ b/amd/device-libs/opencl/src/integer/integer_dot.cl
+@@ -0,0 +1,35 @@
++/*===--------------------------------------------------------------------------
++ *                   ROCm Device Libraries
++ *
++ * This file is distributed under the University of Illinois Open Source
++ * License. See LICENSE.TXT for details.
++ *===------------------------------------------------------------------------*/
++
++// cl_khr_integer_dot_product: 8-bit dot products, vector (char4/uchar4) and packed (uint holding
++// four bytes, byte 0 = component 0) forms, plain and with saturating accumulation. Portable C:
++// the library is target-independent, so no dot4 builtin; the result can never overflow its type
++// (|sum| <= 4 * 255 * 255), only the accumulation saturates.
++
++#define ATTR __attribute__((overloadable, const))
++
++static inline int sdot(int4 a, int4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
++
++ATTR uint dot(uchar4 a, uchar4 b) { return (uint)sdot(convert_int4(a), convert_int4(b)); }
++ATTR int  dot(char4 a, char4 b)   { return sdot(convert_int4(a), convert_int4(b)); }
++ATTR int  dot(uchar4 a, char4 b)  { return sdot(convert_int4(a), convert_int4(b)); }
++ATTR int  dot(char4 a, uchar4 b)  { return sdot(convert_int4(a), convert_int4(b)); }
++
++ATTR uint dot_acc_sat(uchar4 a, uchar4 b, uint acc) { return add_sat(dot(a, b), acc); }
++ATTR int  dot_acc_sat(char4 a, char4 b, int acc)    { return add_sat(dot(a, b), acc); }
++ATTR int  dot_acc_sat(uchar4 a, char4 b, int acc)   { return add_sat(dot(a, b), acc); }
++ATTR int  dot_acc_sat(char4 a, uchar4 b, int acc)   { return add_sat(dot(a, b), acc); }
++
++ATTR uint dot_4x8packed_uu_uint(uint a, uint b) { return dot(as_uchar4(a), as_uchar4(b)); }
++ATTR int  dot_4x8packed_ss_int(uint a, uint b)  { return dot(as_char4(a), as_char4(b)); }
++ATTR int  dot_4x8packed_us_int(uint a, uint b)  { return dot(as_uchar4(a), as_char4(b)); }
++ATTR int  dot_4x8packed_su_int(uint a, uint b)  { return dot(as_char4(a), as_uchar4(b)); }
++
++ATTR uint dot_acc_sat_4x8packed_uu_uint(uint a, uint b, uint acc) { return add_sat(dot_4x8packed_uu_uint(a, b), acc); }
++ATTR int  dot_acc_sat_4x8packed_ss_int(uint a, uint b, int acc)   { return add_sat(dot_4x8packed_ss_int(a, b), acc); }
++ATTR int  dot_acc_sat_4x8packed_us_int(uint a, uint b, int acc)   { return add_sat(dot_4x8packed_us_int(a, b), acc); }
++ATTR int  dot_acc_sat_4x8packed_su_int(uint a, uint b, int acc)   { return add_sat(dot_4x8packed_su_int(a, b), acc); }
+-- 
+2.56.0.windows.4
+
