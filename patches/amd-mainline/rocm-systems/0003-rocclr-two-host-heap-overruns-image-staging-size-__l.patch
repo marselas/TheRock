@@ -1,0 +1,107 @@
+From 6d75a874c1eb055c155c886d572abb490fa2b3f2 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 21:46:35 -0800
+Subject: [PATCH] rocclr: two host heap overruns (image staging size, __local
+ memories[] store)
+
+- KernelParameters::captureHIPArgs stored memories[desc.info_.arrayIndex_] for every T_POINTER
+  argument, but for a __local (dynamic_shared_pointer) argument arrayIndex_ holds the POINTEE
+  ALIGNMENT, not a memory-object slot: a __local long16* wrote memories[128], far past the
+  array, corrupting the kernel-parameter heap block (verifier: corrupted suffix pattern in
+  KernelParameters::release). __local pointers now skip the store.
+- pal FindPinSize sized an image transfer's staging copy as pitch * rows (* slices), a FULL
+  pitch for the last row: for a sub-region whose host rows sit inside a wider buffer,
+  writeImage read and readImage WROTE up to pitch - width * elementSize bytes past the end of
+  the host buffer. It is now the exact extent the copy touches; pitch normalization unchanged.
+
+Both found with full page heap (OpenCL CTS basic: vstore_local, kernel_memory_alignment_local,
+imagereadwrite). The first also caused CTS basic async_strided_copy/prefetch mismatches whenever
+the heap layout put live data after the block.
+---
+ projects/clr/rocclr/device/pal/palblit.cpp | 24 ++++++++++++++++++++--
+ projects/clr/rocclr/platform/kernel.cpp    | 19 +++++++++++------
+ 2 files changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/projects/clr/rocclr/device/pal/palblit.cpp b/projects/clr/rocclr/device/pal/palblit.cpp
+index c1beb8771d..a5f05af217 100644
+--- a/projects/clr/rocclr/device/pal/palblit.cpp
++++ b/projects/clr/rocclr/device/pal/palblit.cpp
+@@ -1663,14 +1663,15 @@ bool KernelBlitManager::copyImage(device::Memory& srcMemory, device::Memory& dst
+ 
+ void FindPinSize(size_t& pinSize, const amd::Coord3D& size, size_t& rowPitch, size_t& slicePitch,
+                  const Memory& mem) {
+-  pinSize = size[0] * mem.elementSize();
++  const size_t rowBytes = size[0] * mem.elementSize();
++  pinSize = rowBytes;
+   if ((rowPitch == 0) || (rowPitch == pinSize)) {
+     rowPitch = 0;
+   } else {
+     pinSize = rowPitch;
+   }
+ 
+-  // Calculate the pin size, which should be equal to the copy size
++  // Normalize the slice pitch exactly as before (callers read rowPitch/slicePitch back).
+   for (uint i = 1; i < mem.desc().dimSize_; ++i) {
+     pinSize *= size[i];
+     if (i == 1) {
+@@ -1685,6 +1686,25 @@ void FindPinSize(size_t& pinSize, const amd::Coord3D& size, size_t& rowPitch, si
+       }
+     }
+   }
++
++  // The bytes the copy actually touches. The products above count a FULL pitch for the last row
++  // (and the last slice), so a sub-region whose host rows sit inside a wider image -- pitch >
++  // width * elementSize -- had its staging copy read (writeImage) or write back (readImage) up to
++  // pitch - width * elementSize bytes past the end of the host buffer: a heap overrun in the app
++  // (page heap: CTS basic imagereadwrite, memcpy in Resource::hostWrite).
++  const size_t rp = rowPitch ? rowPitch : rowBytes;
++  const uint dims = mem.desc().dimSize_;
++  if (dims <= 1) {
++    pinSize = rowBytes;
++  } else if (mem.desc().topology_ == CL_MEM_OBJECT_IMAGE1D_ARRAY) {
++    const size_t sp = slicePitch ? slicePitch : rowBytes;
++    pinSize = (size[1] - 1) * sp + rowBytes;
++  } else if (dims == 2) {
++    pinSize = (size[1] - 1) * rp + rowBytes;
++  } else {
++    const size_t sp = slicePitch ? slicePitch : rp * size[1];
++    pinSize = (size[2] - 1) * sp + (size[1] - 1) * rp + rowBytes;
++  }
+ }
+ 
+ bool KernelBlitManager::readImage(device::Memory& srcMemory, void* dstHost,
+diff --git a/projects/clr/rocclr/platform/kernel.cpp b/projects/clr/rocclr/platform/kernel.cpp
+index c20423a611..ae9641a757 100644
+--- a/projects/clr/rocclr/platform/kernel.cpp
++++ b/projects/clr/rocclr/platform/kernel.cpp
+@@ -105,14 +105,21 @@ bool KernelParameters::captureHIPArgs(void** kernelParams, address kernArgs, siz
+     }
+     if (desc.type_ == T_POINTER) {
+       LP64_SWITCH(uint32_value, uint64_value) = *(LP64_SWITCH(uint32_t*, uint64_t*))value;
+-      Memory* memArg = nullptr;
+-      if (!AMD_DIRECT_DISPATCH) {
+-        memArg = amd::MemObjMap::FindMemObj(*reinterpret_cast<const void* const*>(value));
+-        if (memArg != nullptr) {
+-          memArg->retain();
++      // A __local (dynamic_shared_pointer) argument has no memory-object slot: KernelSignature
++      // stores its POINTEE ALIGNMENT in arrayIndex_, so `memories[arrayIndex_] = ...` wrote past
++      // the array (e.g. memories[128] for a __local long16*), corrupting the heap block of these
++      // parameters whenever they live in a heap allocation (page heap: CTS basic vstore_local,
++      // kernel_memory_alignment_local -- "corrupted suffix pattern" in KernelParameters::release).
++      if (desc.addressQualifier_ != CL_KERNEL_ARG_ADDRESS_LOCAL) {
++        Memory* memArg = nullptr;
++        if (!AMD_DIRECT_DISPATCH) {
++          memArg = amd::MemObjMap::FindMemObj(*reinterpret_cast<const void* const*>(value));
++          if (memArg != nullptr) {
++            memArg->retain();
++          }
+         }
++        memories[desc.info_.arrayIndex_] = memArg;
+       }
+-      memories[desc.info_.arrayIndex_] = memArg;
+     } else {
+       assert((desc.type_ != T_SAMPLER && desc.type_ != T_QUEUE) &&
+              "Unexpected argument type for a HIP kernel");
+-- 
+2.56.0.windows.4
+
