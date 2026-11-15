@@ -1,0 +1,100 @@
+From 3bdc8c34b044e03f94da03a20973f64216ca8403 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 16:23:16 -0800
+Subject: [PATCH 6/6] comgr: OpenCL SPIR-V f32 OpFDiv gets the 2.5 ulp
+ allowance
+
+For an OpenCL action, the translated module's f32 fdiv instructions get
+!fpmath 2.5 -- what clang gives OpenCL C source and what the OpenCL
+SPIR-V environment allows -- unless -cl-fp32-correctly-rounded-divide-sqrt
+is among the options. HIP (and that option) keep correctly rounded
+division. The flag is part of the cache key.
+---
+ amd/comgr/src/comgr-compiler.cpp      |  9 ++++++++-
+ amd/comgr/src/comgr-spirv-command.cpp | 13 +++++++++++++
+ amd/comgr/src/comgr-spirv-command.h   |  7 +++++--
+ 3 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/amd/comgr/src/comgr-compiler.cpp b/amd/comgr/src/comgr-compiler.cpp
+index ea7a1419e9b8..cb5a1e8e6692 100644
+--- a/amd/comgr/src/comgr-compiler.cpp
++++ b/amd/comgr/src/comgr-compiler.cpp
+@@ -2517,7 +2517,14 @@ AMDGPUCompiler::translateSpirvToBitcodeImpl(DataSet *SpirvInSet,
+     }
+ 
+     SmallString<0> OutBuf;
+-    SPIRVCommand SPIRV(Input, OutBuf, OffloadArch);
++    const bool IsOpenCL = ActionInfo->Language == AMD_COMGR_LANGUAGE_OPENCL_1_2 ||
++                          ActionInfo->Language == AMD_COMGR_LANGUAGE_OPENCL_2_0;
++    bool CorrectlyRoundedDiv = false;
++    for (auto &Option : ActionInfo->getOptions())
++      if (Option == "-cl-fp32-correctly-rounded-divide-sqrt")
++        CorrectlyRoundedDiv = true;
++    SPIRVCommand SPIRV(Input, OutBuf, OffloadArch,
++                       IsOpenCL && !CorrectlyRoundedDiv);
+ 
+     amd_comgr_status_t Status;
+     if (!Cache) {
+diff --git a/amd/comgr/src/comgr-spirv-command.cpp b/amd/comgr/src/comgr-spirv-command.cpp
+index 330419cb121f..77cf2e90d231 100644
+--- a/amd/comgr/src/comgr-spirv-command.cpp
++++ b/amd/comgr/src/comgr-spirv-command.cpp
+@@ -12,6 +12,8 @@
+ ///
+ //===----------------------------------------------------------------------===//
+ 
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/MDBuilder.h"
+ #include "comgr-spirv-command.h"
+ 
+ #ifdef COMGR_SPIRV_TRANSLATOR_AVAILABLE
+@@ -70,6 +72,16 @@ amd_comgr_status_t SPIRVCommand::execute(raw_ostream &LogS) {
+     return AMD_COMGR_STATUS_ERROR;
+   }
+ 
++  if (OpenCLDivAccuracy) {
++    MDNode *Acc = MDBuilder(Context).createFPMath(2.5f);
++    for (Function &Fn : *M)
++      for (Instruction &I : instructions(Fn))
++        if (I.getOpcode() == Instruction::FDiv &&
++            I.getType()->getScalarType()->isFloatTy() &&
++            !I.getMetadata(LLVMContext::MD_fpmath))
++          I.setMetadata(LLVMContext::MD_fpmath, Acc);
++  }
++
+   BitcodeWriter Writer(OutputBuffer);
+   Writer.writeModule(*M, false, nullptr, false, nullptr);
+   Writer.writeSymtab();
+@@ -87,6 +99,7 @@ SPIRVCommand::ActionClass SPIRVCommand::getClass() const {
+ void SPIRVCommand::addOptionsIdentifier(HashAlgorithm &H) const {
+   if (!OffloadArch.empty())
+     addString(H, OffloadArch);
++  addString(H, OpenCLDivAccuracy ? "ocl-fdiv-2.5ulp" : "");
+ }
+ 
+ Error SPIRVCommand::addInputIdentifier(HashAlgorithm &H) const {
+diff --git a/amd/comgr/src/comgr-spirv-command.h b/amd/comgr/src/comgr-spirv-command.h
+index 6c17094d7b7c..0e8da5fe7696 100644
+--- a/amd/comgr/src/comgr-spirv-command.h
++++ b/amd/comgr/src/comgr-spirv-command.h
+@@ -18,12 +18,15 @@ public:
+   llvm::StringRef InputBuffer;
+   llvm::SmallVectorImpl<char> &OutputBuffer;
+   std::string OffloadArch;
++  // OpenCL: f32 OpFDiv carries the OpenCL 2.5 ulp allowance (!fpmath), as clang gives
++  // OpenCL C source unless -cl-fp32-correctly-rounded-divide-sqrt.
++  bool OpenCLDivAccuracy = false;
+ 
+ public:
+   SPIRVCommand(DataObject *Input, llvm::SmallVectorImpl<char> &OutputBuffer,
+-               llvm::StringRef OffloadArch = "")
++               llvm::StringRef OffloadArch = "", bool OpenCLDivAccuracy = false)
+       : InputBuffer(Input->Data, Input->Size), OutputBuffer(OutputBuffer),
+-        OffloadArch(OffloadArch) {}
++        OffloadArch(OffloadArch), OpenCLDivAccuracy(OpenCLDivAccuracy) {}
+ 
+   bool canCache() const final { return true; }
+   llvm::Error writeExecuteOutput(llvm::StringRef CachedBuffer) final;
+-- 
+2.56.0.windows.4
+

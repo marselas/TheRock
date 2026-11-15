@@ -1,0 +1,39 @@
+From a22f1c1cf4ac5bacf5a05d5034714980fbf639d3 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 16:23:16 -0800
+Subject: [PATCH 5/6] device-libs: saturated float->int conversions map NaN to
+ 0
+
+convert_<int>_sat clamped with OpenCL max/min, which return the non-NaN
+operand, so NaN became the lower bound: convert_char_sat(NaN) == -128,
+convert_int_sat(NaN) == INT_MIN. OpenCL requires 0. Unsigned targets
+were right only because their lower bound is 0.
+---
+ amd/device-libs/opencl/src/misc/conversions.cl | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/amd/device-libs/opencl/src/misc/conversions.cl b/amd/device-libs/opencl/src/misc/conversions.cl
+index 9e4cdaf2fef2..b8df0819f2ac 100644
+--- a/amd/device-libs/opencl/src/misc/conversions.cl
++++ b/amd/device-libs/opencl/src/misc/conversions.cl
+@@ -218,7 +218,8 @@ convert_##TO##N##S##R(TI##N x) \
+ ATTR TO##N \
+ convert_##TO##N##S##R(TI##N x) \
+ { \
+-    x = min(max(F(x), (TI##N) TO##_##TI##_lb), (TI##N) TO##_##TI##_ub); \
++    TI##N y = min(max(F(x), (TI##N) TO##_##TI##_lb), (TI##N) TO##_##TI##_ub); \
++    x = x == x ? y : (TI##N)0; /* NaN -> 0: max/min return the non-NaN bound */ \
+     return (TO##N)(XLIST##N); \
+ }
+ 
+@@ -264,6 +265,7 @@ ATTR TO##N \
+ convert_##TO##N##S##R(TI##N x) \
+ { \
+     TI##N y = min(max(F(x), (TI##N) TO##_##TI##_lb), (TI##N) TO##_##TI##_ub); \
++    y = x == x ? y : (TI##N)0; /* NaN -> 0 (the bound compares below are false for NaN) */ \
+     TO##N z = (TO##N)(YLIST##N); \
+     z = SEL_##N(z, (TO##N) TO##_minbnd, CMP_##N(TO,TI,x,>,ub)); \
+     return SEL_##N(z, (TO##N) TO##_maxbnd, CMP_##N(TO,TI,x,<,lb)); \
+-- 
+2.56.0.windows.4
+
