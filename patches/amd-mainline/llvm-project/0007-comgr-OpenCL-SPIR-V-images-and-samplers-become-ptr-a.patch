@@ -1,0 +1,174 @@
+From 0c9d8e279f491213decff05546c717a7c2d4a01c Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sat, 14 Nov 2026 17:52:11 -0800
+Subject: [PATCH] comgr: OpenCL SPIR-V images and samplers become ptr
+ addrspace(4)
+
+The SPIR-V reader types OpenCL images and samplers as target("spirv.Image"/
+"spirv.Sampler"/"spirv.SampledImage"); the AMDGPU backend cannot select those
+and instruction selection crashed on the first SPIR-V kernel that read an
+image. For an OpenCL action, rewrite them to ptr addrspace(4) -- what clang
+and the OpenCL device libraries use -- in signatures, instructions and
+constants. The builtin calls are already mangled, so the rewrite is exact;
+kernel metadata comes out image2d_t / value_kind image as from source.
+---
+ amd/comgr/src/comgr-compiler.cpp      |  2 +-
+ amd/comgr/src/comgr-spirv-command.cpp | 90 +++++++++++++++++++++++++++
+ amd/comgr/src/comgr-spirv-command.h   |  8 ++-
+ 3 files changed, 97 insertions(+), 3 deletions(-)
+
+diff --git a/amd/comgr/src/comgr-compiler.cpp b/amd/comgr/src/comgr-compiler.cpp
+index cb5a1e8e6692..cf80e7ae0c0f 100644
+--- a/amd/comgr/src/comgr-compiler.cpp
++++ b/amd/comgr/src/comgr-compiler.cpp
+@@ -2524,7 +2524,7 @@ AMDGPUCompiler::translateSpirvToBitcodeImpl(DataSet *SpirvInSet,
+       if (Option == "-cl-fp32-correctly-rounded-divide-sqrt")
+         CorrectlyRoundedDiv = true;
+     SPIRVCommand SPIRV(Input, OutBuf, OffloadArch,
+-                       IsOpenCL && !CorrectlyRoundedDiv);
++                       IsOpenCL && !CorrectlyRoundedDiv, IsOpenCL);
+ 
+     amd_comgr_status_t Status;
+     if (!Cache) {
+diff --git a/amd/comgr/src/comgr-spirv-command.cpp b/amd/comgr/src/comgr-spirv-command.cpp
+index 77cf2e90d231..757d913fccbd 100644
+--- a/amd/comgr/src/comgr-spirv-command.cpp
++++ b/amd/comgr/src/comgr-spirv-command.cpp
+@@ -25,7 +25,93 @@
+ #include <llvm/TargetParser/AMDGPUTargetParser.h>
+ #include <llvm/TargetParser/Triple.h>
+ 
++#include <llvm/IR/Constants.h>
++#include <llvm/IR/DerivedTypes.h>
++#include <llvm/IR/Module.h>
++#include <llvm/Transforms/Utils/ValueMapper.h>
++
+ #include <sstream>
++
++// The SPIR-V reader gives OpenCL images and samplers target("spirv.Image"/"spirv.Sampler"/
++// "spirv.SampledImage") types, which the AMDGPU backend cannot select (instruction selection
++// crashed on the first OpenCL SPIR-V kernel that read an image). Clang and the OpenCL device
++// libraries represent both as ptr addrspace(4); the builtin calls are already mangled by the
++// time the reader returns, so rewriting the types afterwards is exact.
++namespace {
++using namespace llvm;
++bool isOpenCLOpaque(Type *T) {
++  auto *TE = dyn_cast<TargetExtType>(T);
++  if (!TE)
++    return false;
++  StringRef N = TE->getName();
++  return N == "spirv.Image" || N == "spirv.Sampler" || N == "spirv.SampledImage";
++}
++struct OpaqueToPtr : ValueMapTypeRemapper {
++  LLVMContext &C;
++  DenseMap<Type *, Type *> Cache;
++  explicit OpaqueToPtr(LLVMContext &C) : C(C) {}
++  Type *remapType(Type *T) override {
++    auto It = Cache.find(T);
++    if (It != Cache.end())
++      return It->second;
++    Type *R = T;
++    if (isOpenCLOpaque(T)) {
++      R = PointerType::get(C, 4);
++    } else if (auto *FT = dyn_cast<FunctionType>(T)) {
++      SmallVector<Type *, 8> P;
++      bool Changed = false;
++      for (Type *A : FT->params()) {
++        Type *B = remapType(A);
++        Changed |= B != A;
++        P.push_back(B);
++      }
++      Type *Ret = remapType(FT->getReturnType());
++      Changed |= Ret != FT->getReturnType();
++      if (Changed)
++        R = FunctionType::get(Ret, P, FT->isVarArg());
++    }
++    Cache[T] = R;
++    return R;
++  }
++};
++void remapOpenCLOpaqueTypes(Module &M) {
++  OpaqueToPtr TM(M.getContext());
++  ValueToValueMapTy VMap;
++  SmallVector<Function *, 8> Old;
++  bool Uses = false;
++  for (Function &F : M) {
++    if (TM.remapType(F.getFunctionType()) != F.getFunctionType())
++      Old.push_back(&F);
++    for (Instruction &I : instructions(F))
++      for (Value *Op : I.operands())
++        Uses |= isOpenCLOpaque(Op->getType()) || isOpenCLOpaque(I.getType());
++  }
++  if (Old.empty() && !Uses)
++    return;
++  for (Function *F : Old) {
++    auto *NT = cast<FunctionType>(TM.remapType(F->getFunctionType()));
++    Function *NF = Function::Create(NT, F->getLinkage(), F->getAddressSpace(), "", &M);
++    NF->copyAttributesFrom(F);
++    NF->takeName(F);
++    NF->copyMetadata(F, 0);
++    NF->splice(NF->begin(), F);
++    auto NA = NF->arg_begin();
++    for (Argument &A : F->args()) {
++      NA->takeName(&A);
++      VMap[&A] = &*NA;
++      ++NA;
++    }
++    VMap[F] = NF;
++  }
++  for (Function &F : M)
++    for (Instruction &I : instructions(F))
++      RemapInstruction(&I, VMap, RF_IgnoreMissingLocals, &TM);
++  for (Function *F : Old) {
++    F->replaceAllUsesWith(PoisonValue::get(F->getType()));
++    F->eraseFromParent();
++  }
++}
++} // namespace
+ #endif
+ 
+ namespace COMGR {
+@@ -72,6 +158,9 @@ amd_comgr_status_t SPIRVCommand::execute(raw_ostream &LogS) {
+     return AMD_COMGR_STATUS_ERROR;
+   }
+ 
++  if (OpenCL)
++    remapOpenCLOpaqueTypes(*M);
++
+   if (OpenCLDivAccuracy) {
+     MDNode *Acc = MDBuilder(Context).createFPMath(2.5f);
+     for (Function &Fn : *M)
+@@ -100,6 +189,7 @@ void SPIRVCommand::addOptionsIdentifier(HashAlgorithm &H) const {
+   if (!OffloadArch.empty())
+     addString(H, OffloadArch);
+   addString(H, OpenCLDivAccuracy ? "ocl-fdiv-2.5ulp" : "");
++  addString(H, OpenCL ? "ocl-opaque-ptr4" : "");
+ }
+ 
+ Error SPIRVCommand::addInputIdentifier(HashAlgorithm &H) const {
+diff --git a/amd/comgr/src/comgr-spirv-command.h b/amd/comgr/src/comgr-spirv-command.h
+index 0e8da5fe7696..fd6cc3193dc9 100644
+--- a/amd/comgr/src/comgr-spirv-command.h
++++ b/amd/comgr/src/comgr-spirv-command.h
+@@ -21,12 +21,16 @@ public:
+   // OpenCL: f32 OpFDiv carries the OpenCL 2.5 ulp allowance (!fpmath), as clang gives
+   // OpenCL C source unless -cl-fp32-correctly-rounded-divide-sqrt.
+   bool OpenCLDivAccuracy = false;
++  // OpenCL: image/sampler target types become ptr addrspace(4), as clang and the device libs use.
++  bool OpenCL = false;
+ 
+ public:
+   SPIRVCommand(DataObject *Input, llvm::SmallVectorImpl<char> &OutputBuffer,
+-               llvm::StringRef OffloadArch = "", bool OpenCLDivAccuracy = false)
++               llvm::StringRef OffloadArch = "", bool OpenCLDivAccuracy = false,
++               bool OpenCL = false)
+       : InputBuffer(Input->Data, Input->Size), OutputBuffer(OutputBuffer),
+-        OffloadArch(OffloadArch), OpenCLDivAccuracy(OpenCLDivAccuracy) {}
++        OffloadArch(OffloadArch), OpenCLDivAccuracy(OpenCLDivAccuracy),
++        OpenCL(OpenCL) {}
+ 
+   bool canCache() const final { return true; }
+   llvm::Error writeExecuteOutput(llvm::StringRef CachedBuffer) final;
+-- 
+2.56.0.windows.4
+
