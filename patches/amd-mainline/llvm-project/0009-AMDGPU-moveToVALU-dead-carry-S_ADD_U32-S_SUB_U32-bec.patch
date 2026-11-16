@@ -1,0 +1,114 @@
+From f86d95edf9c0873a21d373644689f161c8b3c0ef Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sun, 15 Nov 2026 20:42:43 -0800
+Subject: [PATCH] [AMDGPU] moveToVALU: dead-carry S_ADD_U32/S_SUB_U32 become
+ V_ADD/SUB_U32_e64 on gfx10+
+
+getVALUOp maps S_ADD_U32/S_SUB_U32 to V_ADD_CO_U32_e32/V_SUB_CO_U32_e32, VOP2 forms that gfx10+
+cannot encode. A uniform llvm.uadd.sat is expanded on the SALU (s_not/s_min_u32/s_add_u32); when an
+input is a VALU result -- e.g. v_dot4_u32_u8 formed from a u8 multiply-add chain -- moveToVALU moved
+the s_add_u32 to V_ADD_CO_U32_e32, and the opcode reached 'Branch relaxation' with no MC encoding:
+'Invalid opcode!' with assertions, an access violation (or a silently bad size) without.
+
+When SCC (the carry-out) is dead these are plain 32-bit adds, so route them through
+moveScalarAddSub like S_ADD_I32/S_SUB_I32, which emits the no-carry e64 form. A live carry keeps
+the old path.
+
+Test: CodeGen/AMDGPU/uaddsat-uniform-divergent-input-gfx12.ll (gfx1201, gfx1030). The whole
+CodeGen/AMDGPU lit suite passes (5220 tests, assertions build).
+---
+ llvm/lib/Target/AMDGPU/SIInstrInfo.cpp        | 15 +++++-
+ .../uaddsat-uniform-divergent-input-gfx12.ll  | 47 +++++++++++++++++++
+ 2 files changed, 60 insertions(+), 2 deletions(-)
+ create mode 100644 llvm/test/CodeGen/AMDGPU/uaddsat-uniform-divergent-input-gfx12.ll
+
+diff --git a/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp b/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp
+index 95168b6eddb2..615a53d8f0dd 100644
+--- a/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp
++++ b/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp
+@@ -8480,6 +8480,16 @@ void SIInstrInfo::moveToVALUImpl(
+   switch (Opcode) {
+   default:
+     break;
++  case AMDGPU::S_ADD_U32:
++  case AMDGPU::S_SUB_U32:
++    // With the carry-out unused these are plain 32-bit adds. getVALUOp maps them to
++    // V_ADD_CO_U32_e32 / V_SUB_CO_U32_e32, VOP2 forms that gfx10+ no longer encode: a uniform
++    // uadd.sat (s_not/s_min/s_add_u32) whose input became divergent reached "Branch relaxation"
++    // with an opcode that has no MC encoding. Take the no-carry path instead when SCC is dead.
++    if (!ST.hasAddNoCarryInsts() || !Inst.getOperand(3).isReg() ||
++        Inst.getOperand(3).getReg() != AMDGPU::SCC || !Inst.getOperand(3).isDead())
++      break;
++    [[fallthrough]];
+   case AMDGPU::S_ADD_I32:
+   case AMDGPU::S_SUB_I32: {
+     // FIXME: The u32 versions currently selected use the carry.
+@@ -9177,9 +9187,10 @@ SIInstrInfo::moveScalarAddSub(SIInstrWorklist &Worklist, MachineInstr &Inst,
+     Register ResultReg = MRI.createVirtualRegister(&AMDGPU::VGPR_32RegClass);
+ 
+     unsigned Opc = Inst.getOpcode();
+-    assert(Opc == AMDGPU::S_ADD_I32 || Opc == AMDGPU::S_SUB_I32);
++    assert(Opc == AMDGPU::S_ADD_I32 || Opc == AMDGPU::S_SUB_I32 ||
++           Opc == AMDGPU::S_ADD_U32 || Opc == AMDGPU::S_SUB_U32);
+ 
+-    unsigned NewOpc = Opc == AMDGPU::S_ADD_I32 ?
++    unsigned NewOpc = (Opc == AMDGPU::S_ADD_I32 || Opc == AMDGPU::S_ADD_U32) ?
+       AMDGPU::V_ADD_U32_e64 : AMDGPU::V_SUB_U32_e64;
+ 
+     assert(Inst.getOperand(3).getReg() == AMDGPU::SCC);
+diff --git a/llvm/test/CodeGen/AMDGPU/uaddsat-uniform-divergent-input-gfx12.ll b/llvm/test/CodeGen/AMDGPU/uaddsat-uniform-divergent-input-gfx12.ll
+new file mode 100644
+index 000000000000..a12838b6dad9
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/uaddsat-uniform-divergent-input-gfx12.ll
+@@ -0,0 +1,47 @@
++; RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1201 -verify-machineinstrs < %s | FileCheck %s
++; RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1030 -verify-machineinstrs < %s | FileCheck %s
++
++; A uniform llvm.uadd.sat is expanded on the SALU (s_not / s_min_u32 / s_add_u32). When one input
++; is a VALU result (here v_dot4_u32_u8 formed from the u8 multiply-add chain), moveToVALU moves the
++; s_add_u32 too. It used to become V_ADD_CO_U32_e32, a VOP2 form gfx10+ cannot encode ("Invalid
++; opcode!" in branch relaxation, an access violation without assertions). With the carry dead it
++; must become the no-carry v_add_nc_u32.
++
++; CHECK-LABEL: {{^}}uniform_dot_uaddsat:
++; CHECK: v_dot4_u32_u8
++; CHECK: v_min_u32
++; CHECK: v_{{(dual_)?}}add_nc_u32
++; CHECK-NOT: v_add_co_u32_e32
++define amdgpu_kernel void @uniform_dot_uaddsat(ptr addrspace(1) %d, ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c) {
++  %va = load <4 x i8>, ptr addrspace(1) %a, align 4
++  %vb = load <4 x i8>, ptr addrspace(1) %b, align 4
++  %acc = load i32, ptr addrspace(1) %c, align 4
++  %a0 = extractelement <4 x i8> %va, i64 0
++  %a1 = extractelement <4 x i8> %va, i64 1
++  %a2 = extractelement <4 x i8> %va, i64 2
++  %a3 = extractelement <4 x i8> %va, i64 3
++  %b0 = extractelement <4 x i8> %vb, i64 0
++  %b1 = extractelement <4 x i8> %vb, i64 1
++  %b2 = extractelement <4 x i8> %vb, i64 2
++  %b3 = extractelement <4 x i8> %vb, i64 3
++  %za0 = zext i8 %a0 to i32
++  %za1 = zext i8 %a1 to i32
++  %za2 = zext i8 %a2 to i32
++  %za3 = zext i8 %a3 to i32
++  %zb0 = zext i8 %b0 to i32
++  %zb1 = zext i8 %b1 to i32
++  %zb2 = zext i8 %b2 to i32
++  %zb3 = zext i8 %b3 to i32
++  %m0 = mul nuw nsw i32 %zb0, %za0
++  %m1 = mul nuw nsw i32 %zb1, %za1
++  %s1 = add nuw nsw i32 %m0, %m1
++  %m2 = mul nuw nsw i32 %zb2, %za2
++  %s2 = add nuw nsw i32 %s1, %m2
++  %m3 = mul nuw nsw i32 %zb3, %za3
++  %s3 = add nuw nsw i32 %s2, %m3
++  %r = call i32 @llvm.uadd.sat.i32(i32 %s3, i32 %acc)
++  store i32 %r, ptr addrspace(1) %d, align 4
++  ret void
++}
++
++declare i32 @llvm.uadd.sat.i32(i32, i32)
+-- 
+2.56.0.windows.4
+
