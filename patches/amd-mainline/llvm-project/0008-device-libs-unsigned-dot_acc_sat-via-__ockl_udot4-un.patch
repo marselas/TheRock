@@ -1,0 +1,58 @@
+From 4ecaf672c9c2bc1e9e99a0802b8f748362a00531 Mon Sep 17 00:00:00 2001
+From: Herbert Marselas <marselas@gmail.com>
+Date: Sun, 15 Nov 2026 20:30:39 -0800
+Subject: [PATCH] device-libs: unsigned dot_acc_sat via __ockl_udot4 (uniform
+ call crashed gfx12 codegen)
+
+dot_acc_sat(uchar4, uchar4, uint) and dot_acc_sat_4x8packed_uu_uint were add_sat(dot(a, b), acc).
+With wave-uniform operands, gfx1201 codegen crashed in 'Branch relaxation' (access violation): the
+backend forms v_dot4_u32_u8 on SGPRs and the llvm.uadd.sat expansion that follows takes it down.
+Any equivalent C is canonicalized back to uadd.sat by InstCombine, so these now call ockl's udot4
+with saturation: v_dot4_u32_u8 ... clamp where the ISA has it, ockl's own C elsewhere. The signed
+and mixed-sign forms do not hit the crash and are unchanged.
+
+Verified on gfx1201: 65,536 per-item + 64 uniform values exact (8,397 saturating), CTS
+integer_ops integer_dot_product passes.
+---
+ amd/device-libs/opencl/src/integer/integer_dot.cl | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/amd/device-libs/opencl/src/integer/integer_dot.cl b/amd/device-libs/opencl/src/integer/integer_dot.cl
+index e7f897127889..06f0afe90952 100644
+--- a/amd/device-libs/opencl/src/integer/integer_dot.cl
++++ b/amd/device-libs/opencl/src/integer/integer_dot.cl
+@@ -12,6 +12,13 @@
+ 
+ #define ATTR __attribute__((overloadable, const))
+ 
++// The unsigned saturating forms go through ockl's udot4 (v_dot4_u32_u8 with clamp where the ISA
++// has it, ockl's own C elsewhere). Written as add_sat(dot(a, b), acc) -- or any equivalent C, which
++// InstCombine turns back into llvm.uadd.sat -- a WAVE-UNIFORM call crashed the gfx12 backend in
++// "Branch relaxation" (v_dot4 on SGPR operands feeding the uadd.sat expansion); the signed and
++// mixed forms do not hit it.
++uint __ockl_udot4(uchar4, uchar4, uint, bool);
++
+ static inline int sdot(int4 a, int4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+ 
+ ATTR uint dot(uchar4 a, uchar4 b) { return (uint)sdot(convert_int4(a), convert_int4(b)); }
+@@ -19,7 +26,7 @@ ATTR int  dot(char4 a, char4 b)   { return sdot(convert_int4(a), convert_int4(b)
+ ATTR int  dot(uchar4 a, char4 b)  { return sdot(convert_int4(a), convert_int4(b)); }
+ ATTR int  dot(char4 a, uchar4 b)  { return sdot(convert_int4(a), convert_int4(b)); }
+ 
+-ATTR uint dot_acc_sat(uchar4 a, uchar4 b, uint acc) { return add_sat(dot(a, b), acc); }
++ATTR uint dot_acc_sat(uchar4 a, uchar4 b, uint acc) { return __ockl_udot4(a, b, acc, true); }
+ ATTR int  dot_acc_sat(char4 a, char4 b, int acc)    { return add_sat(dot(a, b), acc); }
+ ATTR int  dot_acc_sat(uchar4 a, char4 b, int acc)   { return add_sat(dot(a, b), acc); }
+ ATTR int  dot_acc_sat(char4 a, uchar4 b, int acc)   { return add_sat(dot(a, b), acc); }
+@@ -29,7 +36,7 @@ ATTR int  dot_4x8packed_ss_int(uint a, uint b)  { return dot(as_char4(a), as_cha
+ ATTR int  dot_4x8packed_us_int(uint a, uint b)  { return dot(as_uchar4(a), as_char4(b)); }
+ ATTR int  dot_4x8packed_su_int(uint a, uint b)  { return dot(as_char4(a), as_uchar4(b)); }
+ 
+-ATTR uint dot_acc_sat_4x8packed_uu_uint(uint a, uint b, uint acc) { return add_sat(dot_4x8packed_uu_uint(a, b), acc); }
++ATTR uint dot_acc_sat_4x8packed_uu_uint(uint a, uint b, uint acc) { return __ockl_udot4(as_uchar4(a), as_uchar4(b), acc, true); }
+ ATTR int  dot_acc_sat_4x8packed_ss_int(uint a, uint b, int acc)   { return add_sat(dot_4x8packed_ss_int(a, b), acc); }
+ ATTR int  dot_acc_sat_4x8packed_us_int(uint a, uint b, int acc)   { return add_sat(dot_4x8packed_us_int(a, b), acc); }
+ ATTR int  dot_acc_sat_4x8packed_su_int(uint a, uint b, int acc)   { return add_sat(dot_4x8packed_su_int(a, b), acc); }
+-- 
+2.56.0.windows.4
+
